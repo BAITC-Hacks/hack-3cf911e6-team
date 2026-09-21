@@ -88,8 +88,8 @@ class TestRulesEdgeCases(unittest.TestCase):
         _, _, signals = cm.classify_by_rules("Предлагаю поставить кулер на 3 этаже")
         self.assertTrue(signals)
         for signal in signals:
-            self.assertNotIn("|", signal)
-            self.assertNotIn("\\b", signal)
+            for syntax in ("|", "\\b", "[", "]"):
+                self.assertNotIn(syntax, signal)
 
     def test_llm_disagreement_is_flagged_for_review(self):
         # Категория берётся от LLM, но расхождение с правилами понижает уверенность.
