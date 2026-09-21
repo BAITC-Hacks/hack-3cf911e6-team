@@ -2,22 +2,17 @@
 """Классификатор обращений: категория + черновик ответа для каждого обращения.
 
 Запуск:
-    python classify_messages.py                 # правила, читает messages.txt
-    python classify_messages.py other.txt       # другой файл (одно обращение на строку)
-    python classify_messages.py --json          # машиночитаемый вывод
-    python classify_messages.py --llm           # категории одним запросом к Claude
+    python classify_messages.py              # читает messages.txt рядом со скриптом
+    python classify_messages.py other.txt    # другой файл, одно обращение на строку
 
 Категории: справка / жалоба / другое.
     справка — просят информацию или документ («как получить», «где», «сколько»);
     жалоба  — сообщают о проблеме или недовольстве («пропал», «очередь», «холодная»);
     другое  — всё остальное: запись на приём, предложения, заявки.
 
-По умолчанию зависимостей нет — только стандартная библиотека Python 3.8+.
-Режим --llm требует `pip install anthropic` и ключ ANTHROPIC_API_KEY; при любой
-ошибке скрипт не падает, а возвращается к правилам.
+Зависимостей нет — только стандартная библиотека Python 3.8+.
 """
 
-import json
 import re
 import sys
 import textwrap
@@ -32,7 +27,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 CATEGORIES = ("справка", "жалоба", "другое")
 FALLBACK_CATEGORY = "другое"
-MODEL = "claude-opus-5"
 
 # --- Правила категоризации -------------------------------------------------
 # (regex, вес). Веса подобраны так, чтобы явный маркер (3) перевешивал слабый (1).
@@ -131,8 +125,8 @@ def marker_label(pattern):
     return pattern.split("|")[0].replace(r"\b", "").strip()
 
 
-def score_categories(text):
-    """Считает баллы по каждой категории. Возвращает (баллы, сработавшие маркеры)."""
+def classify(text):
+    """Категория обращения. Возвращает (категория, уверенность, сработавшие маркеры)."""
     norm = normalize(text)
     scores = {category: 0 for category in CATEGORIES}
     signals = {category: [] for category in CATEGORIES}
@@ -144,19 +138,13 @@ def score_categories(text):
     if norm.endswith("?"):  # слабый сигнал: вопрос чаще запрос информации
         scores["справка"] += 1
         signals["справка"].append("вопросительный знак")
-    return scores, signals
 
-
-def classify_by_rules(text):
-    """Категория по правилам + уверенность и сработавшие маркеры."""
-    scores, signals = score_categories(text)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best, best_score = ranked[0]
-    runner_up_score = ranked[1][1]
     if best_score == 0:  # ни одного маркера — честно отправляем в «другое»
         return FALLBACK_CATEGORY, "низкая", []
     # Отрыв меньше 2 баллов — спорный случай, такие стоит посмотреть руками.
-    confidence = "высокая" if best_score - runner_up_score >= 2 else "низкая"
+    confidence = "высокая" if best_score - ranked[1][1] >= 2 else "низкая"
     return best, confidence, signals[best]
 
 
@@ -176,153 +164,13 @@ def draft_reply(category, topic):
     return REPLIES.get((category, topic)) or REPLIES_BY_CATEGORY[category]
 
 
-# --- Опциональный режим LLM ------------------------------------------------
-LLM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer"},
-                    "category": {"type": "string", "enum": list(CATEGORIES)},
-                },
-                "required": ["id", "category"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["items"],
-    "additionalProperties": False,
-}
-
-LLM_SYSTEM = (
-    "Ты классифицируешь обращения студентов в службу поддержки вуза. "
-    "Категории строго три:\n"
-    "справка — просят информацию или документ (как получить, где, сколько, режим работы);\n"
-    "жалоба — сообщают о проблеме, поломке или недовольстве сервисом;\n"
-    "другое — всё остальное: запись на приём, предложения, заявки.\n"
-    "Верни категорию для каждого обращения по его номеру, без пояснений."
-)
-
-
-def classify_with_llm(texts):
-    """Одним запросом получает категории для всех обращений.
-
-    Возвращает список ответов модели по номерам обращений (None в позициях, которых
-    в ответе не было) либо None целиком, если запрос не удался — тогда вызывающий код
-    работает по правилам. Значения не проверяются здесь: это делает build_results.
-    """
-    try:
-        import anthropic
-    except ImportError:
-        print("режим --llm: пакет anthropic не установлен (pip install anthropic) — "
-              "категории по правилам", file=sys.stderr)
-        return None
-
-    numbered = "\n".join(f"{i}. {text}" for i, text in enumerate(texts, 1))
-    try:
-        client = anthropic.Anthropic()  # ключ из ANTHROPIC_API_KEY или профиля ant auth login
-        response = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=LLM_SYSTEM,
-            messages=[{"role": "user", "content": f"Обращения:\n{numbered}"}],
-            # Задача простая — низкий effort дешевле и быстрее; схема гарантирует валидный JSON.
-            output_config={
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": LLM_SCHEMA},
-            },
-            # Если модель откажется отвечать, запрос доигрывается на резервной модели.
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        if response.stop_reason == "refusal":
-            print("режим --llm: модель отклонила запрос — категории по правилам", file=sys.stderr)
-            return None
-        payload = json.loads(next(b.text for b in response.content if b.type == "text"))
-    except Exception as exc:  # сеть, ключ, лимиты, формат — любой сбой не должен ронять скрипт
-        print(f"режим --llm: {type(exc).__name__}: {exc} — категории по правилам", file=sys.stderr)
-        return None
-
-    # Ответ может не содержать какой-то номер; валидирует категории build_results.
-    by_id = {item["id"]: item["category"] for item in payload.get("items", [])}
-    return [by_id.get(index) for index in range(1, len(texts) + 1)]
-
-
-# --- Разбор входа и вывод --------------------------------------------------
 def read_messages(path):
     with open(path, encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
 
-def build_results(texts, llm_categories):
-    """Собирает по каждому обращению категорию, тему, уверенность и черновик."""
-    results = []
-    for index, text in enumerate(texts, 1):
-        rule_category, confidence, signals = classify_by_rules(text)
-        category, source = rule_category, "правила"
-        if llm_categories:
-            llm_category = llm_categories[index - 1]
-            # Единственное место, где проверяется категория: что угодно вне трёх
-            # разрешённых значений (пропущенный номер, ответ не по схеме) — это правила.
-            if llm_category in CATEGORIES:
-                category, source = llm_category, "llm"
-                if category != rule_category:  # расхождение — повод проверить руками
-                    confidence = "низкая"
-        topic = detect_topic(text)
-        results.append({
-            "id": index,
-            "text": text,
-            "category": category,
-            "confidence": confidence,
-            "source": source,
-            # Категория и сигналы правил сохраняются всегда — это кросс-проверка ответа LLM.
-            "rule_category": rule_category,
-            "signals": signals,
-            "topic": topic,
-            "reply": draft_reply(category, topic),
-        })
-    return results
-
-
-def print_report(results, source_label):
-    print(f"Обращений: {len(results)} | категории: {source_label}")
-    print("=" * 78)
-    for item in results:
-        print(f"[{item['id']}] {item['text']}")
-        details = [f"уверенность: {item['confidence']}"]
-        if item["topic"]:
-            details.append(f"тема: {item['topic']}")
-        if item["category"] != item["rule_category"]:
-            # Категория от LLM разошлась с правилами — показываем расхождение, а не
-            # сигналы чужой категории, иначе объяснение противоречит вердикту.
-            details.append(f"правила дали: {item['rule_category']}")
-        elif item["signals"]:
-            details.append("сигналы: " + ", ".join(item["signals"]))
-        print(f"    категория: {item['category']}  ({'; '.join(details)})")
-        print("    черновик ответа:")
-        for line in textwrap.wrap(item["reply"], width=74):
-            print(f"      {line}")
-        print()
-    counts = {c: sum(1 for i in results if i["category"] == c) for c in CATEGORIES}
-    print("-" * 78)
-    print("Итого: " + ", ".join(f"{c} — {n}" for c, n in counts.items()))
-    unsure = [str(i["id"]) for i in results if i["confidence"] == "низкая"]
-    if unsure:
-        print(f"На ручную проверку (низкая уверенность): {', '.join(unsure)}")
-
-
 def main(argv):
-    flags = {a for a in argv[1:] if a.startswith("--")}
-    args = [a for a in argv[1:] if not a.startswith("--")]
-    unknown = flags - {"--llm", "--json"}
-    if unknown:
-        print(f"Неизвестные флаги: {', '.join(sorted(unknown))}", file=sys.stderr)
-        return 2
-
-    path = Path(args[0]) if args else Path(__file__).with_name("messages.txt")
+    path = Path(argv[1]) if len(argv) > 1 else Path(__file__).with_name("messages.txt")
     if not path.exists():
         print(f"Файл не найден: {path}", file=sys.stderr)
         return 1
@@ -331,13 +179,30 @@ def main(argv):
         print(f"В файле {path} нет обращений", file=sys.stderr)
         return 1
 
-    llm_categories = classify_with_llm(texts) if "--llm" in flags else None
-    results = build_results(texts, llm_categories)
+    counts = {category: 0 for category in CATEGORIES}
+    unsure = []
+    for index, text in enumerate(texts, 1):
+        category, confidence, signals = classify(text)
+        topic = detect_topic(text)
+        counts[category] += 1
+        if confidence == "низкая":
+            unsure.append(str(index))
 
-    if "--json" in flags:
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-    else:
-        print_report(results, f"LLM ({MODEL})" if llm_categories else "правила")
+        details = [f"уверенность: {confidence}"]
+        if topic:
+            details.append(f"тема: {topic}")
+        if signals:
+            details.append("сигналы: " + ", ".join(signals))
+        print(f"[{index}] {text}")
+        print(f"    категория: {category}  ({'; '.join(details)})")
+        print("    черновик ответа:")
+        for line in textwrap.wrap(draft_reply(category, topic), width=74):
+            print(f"      {line}")
+        print()
+
+    print("Итого: " + ", ".join(f"{c} — {n}" for c, n in counts.items()))
+    if unsure:
+        print(f"На ручную проверку (низкая уверенность): {', '.join(unsure)}")
     return 0
 
 

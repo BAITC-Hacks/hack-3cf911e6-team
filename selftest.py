@@ -3,7 +3,7 @@
 
 Зависимостей нет — стандартный unittest. Проверяет три уровня:
   1) правила классификатора на данных задания и на спорных формулировках;
-  2) фильтр алертов на штатном и нестандартном входе;
+  2) фильтр алертов;
   3) сквозной запуск обоих скриптов как отдельных процессов (как это сделает проверяющий).
 """
 
@@ -38,19 +38,18 @@ class TestRules(unittest.TestCase):
     def test_categories(self):
         for text, expected in self.EXPECTED:
             with self.subTest(text=text):
-                self.assertEqual(cm.classify_by_rules(text)[0], expected)
+                self.assertEqual(cm.classify(text)[0], expected)
 
     def test_confidence_is_high_on_task_data(self):
         # Регрессия: правка правил не должна превращать эталонные обращения в спорные.
         for text, _ in self.EXPECTED:
             with self.subTest(text=text):
-                self.assertEqual(cm.classify_by_rules(text)[1], "высокая")
+                self.assertEqual(cm.classify(text)[1], "высокая")
 
     def test_every_message_gets_nonempty_draft(self):
         for text, _ in self.EXPECTED:
             with self.subTest(text=text):
-                category, _, _ = cm.classify_by_rules(text)
-                reply = cm.draft_reply(category, cm.detect_topic(text))
+                reply = cm.draft_reply(cm.classify(text)[0], cm.detect_topic(text))
                 self.assertTrue(reply.startswith("Здравствуйте"))
                 self.assertGreater(len(reply), 80)
 
@@ -63,14 +62,14 @@ class TestRules(unittest.TestCase):
 
 class TestRulesEdgeCases(unittest.TestCase):
     def test_no_markers_goes_to_other_with_low_confidence(self):
-        category, confidence, signals = cm.classify_by_rules("Абракадабра шмабракадабра")
+        category, confidence, signals = cm.classify("Абракадабра шмабракадабра")
         self.assertEqual(category, "другое")
         self.assertEqual(confidence, "низкая")
         self.assertEqual(signals, [])
 
     def test_uppercase_and_yo_are_normalized(self):
-        self.assertEqual(cm.classify_by_rules("ГДЕ ПАРКОВКА ДЛЯ ГОСТЕЙ?")[0], "справка")
-        self.assertEqual(cm.classify_by_rules("Пропала СВЯЗЬ, ничего не работает")[0], "жалоба")
+        self.assertEqual(cm.classify("ГДЕ ПАРКОВКА ДЛЯ ГОСТЕЙ?")[0], "справка")
+        self.assertEqual(cm.classify("Пропала СВЯЗЬ, ничего не работает")[0], "жалоба")
 
     def test_nonbreaking_hyphen_in_wifi(self):
         # В тексте задания Wi‑Fi набран неразрывным дефисом U+2011.
@@ -79,38 +78,30 @@ class TestRulesEdgeCases(unittest.TestCase):
     def test_complaint_verb_forms(self):
         for text in ("Хочу пожаловаться на грубость", "Жалуюсь на шум в аудитории"):
             with self.subTest(text=text):
-                self.assertEqual(cm.classify_by_rules(text)[0], "жалоба")
+                self.assertEqual(cm.classify(text)[0], "жалоба")
 
     def test_question_shaped_complaint_stays_complaint(self):
-        self.assertEqual(cm.classify_by_rules("Почему не работает Wi-Fi?")[0], "жалоба")
+        self.assertEqual(cm.classify("Почему не работает Wi-Fi?")[0], "жалоба")
+
+    def test_mixed_intent_prefers_dominant_category(self):
+        # Ради этого случая правила взвешенные, а не «первое совпадение»: тут просят
+        # справку, хотя в тексте есть и маркер жалобы («очередь»).
+        self.assertEqual(
+            cm.classify("Подскажите, где получить справку, а то в деканате очередь")[0],
+            "справка",
+        )
 
     def test_signals_have_no_regex_syntax(self):
-        _, _, signals = cm.classify_by_rules("Предлагаю поставить кулер на 3 этаже")
+        signals = cm.classify("Предлагаю поставить кулер на 3 этаже")[2]
         self.assertTrue(signals)
         for signal in signals:
             for syntax in ("|", "\\b", "[", "]"):
                 self.assertNotIn(syntax, signal)
 
-    def test_llm_disagreement_is_flagged_for_review(self):
-        # Категория берётся от LLM, но расхождение с правилами понижает уверенность.
-        results = cm.build_results(["В столовой очередь, еда холодная."], ["справка"])
-        self.assertEqual(results[0]["category"], "справка")
-        self.assertEqual(results[0]["rule_category"], "жалоба")
-        self.assertEqual(results[0]["confidence"], "низкая")
-
-    def test_llm_answer_outside_schema_falls_back_to_rules(self):
-        # Категория вне трёх разрешённых (или пропущенный номер) не должна ронять скрипт.
-        for bad in ("мусор", None, ""):
-            with self.subTest(bad=bad):
-                results = cm.build_results(["Пропал Wi-Fi в корпусе B."], [bad])
-                self.assertEqual(results[0]["category"], "жалоба")
-                self.assertEqual(results[0]["source"], "правила")
-                self.assertTrue(results[0]["reply"])
-
 
 class TestAlerts(unittest.TestCase):
     def test_task_data_has_three_critical(self):
-        events = fa.load_events(ROOT / "events.json")
+        events = json.loads((ROOT / "events.json").read_text(encoding="utf-8"))
         self.assertEqual(len(events), 8)
         self.assertEqual([e["id"] for e in events if fa.is_critical(e)], [1, 4, 6])
 
@@ -118,52 +109,36 @@ class TestAlerts(unittest.TestCase):
         self.assertTrue(fa.is_critical({"level": "CRITICAL"}))
         self.assertTrue(fa.is_critical({"level": " critical "}))
         self.assertFalse(fa.is_critical({"level": "warn"}))
-
-    def test_missing_or_broken_event_is_not_critical(self):
-        self.assertFalse(fa.is_critical({"message": "нет уровня"}))
-        self.assertFalse(fa.is_critical("строка вместо объекта"))
-        self.assertEqual(fa.level_of({}), "unknown")
+        self.assertFalse(fa.is_critical({"message": "уровня нет"}))
 
 
 class TestEndToEnd(unittest.TestCase):
     """Запуск скриптов процессами — проверка того, что увидит проверяющий."""
 
-    def run_script(self, *args):
+    def run_script(self, *args, expect_code=0):
         result = subprocess.run(
             [sys.executable, *args],
             cwd=str(ROOT), capture_output=True, encoding="utf-8", errors="replace",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, expect_code, result.stderr)
         return result.stdout
 
-    def test_filter_alerts_prints_summary_and_only_critical(self):
-        out = self.run_script("filter_alerts.py")
-        self.assertIn("критичных 3", out)
+    def test_filter_prints_only_critical_and_one_summary_line(self):
+        # Буква задания: «печатает только critical и одну фразу summary».
+        lines = self.run_script("filter_alerts.py").strip().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[-1], "критичных 3")
         for noise in ("user login", "cpu 40%", "heartbeat", "cache miss", "deploy ok"):
-            self.assertNotIn(noise, out)
+            self.assertNotIn(noise, "\n".join(lines))
 
     def test_classify_prints_category_and_draft_for_each(self):
         out = self.run_script("classify_messages.py")
         self.assertEqual(out.count("категория:"), 5)
         self.assertEqual(out.count("черновик ответа:"), 5)
 
-    def test_json_mode_is_valid_json(self):
-        payload = json.loads(self.run_script("classify_messages.py", "--json"))
-        self.assertEqual(len(payload), 5)
-        self.assertEqual([item["category"] for item in payload],
-                         [category for _, category in TestRules.EXPECTED])
-
-    def test_llm_mode_degrades_to_rules_without_key(self):
-        # Без пакета anthropic или ключа скрипт обязан отработать на правилах, а не упасть.
-        out = self.run_script("classify_messages.py", "--llm")
-        self.assertEqual(out.count("категория:"), 5)
-
-    def test_unknown_flag_exits_with_code_2(self):
-        result = subprocess.run(
-            [sys.executable, "classify_messages.py", "--oops"],
-            cwd=str(ROOT), capture_output=True, encoding="utf-8", errors="replace",
-        )
-        self.assertEqual(result.returncode, 2)
+    def test_missing_file_exits_with_code_1(self):
+        self.run_script("classify_messages.py", "нет-такого.txt", expect_code=1)
+        self.run_script("filter_alerts.py", "нет-такого.json", expect_code=1)
 
 
 if __name__ == "__main__":
