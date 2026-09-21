@@ -11,7 +11,7 @@ cd hack-3cf911e6-team
 
 python classify_messages.py     # кейс 1  (Windows: py classify_messages.py)
 python filter_alerts.py         # кейс 2
-python selftest.py              # 17 автопроверок, ожидается OK
+python selftest.py              # 22 автопроверки, ожидается OK
 ```
 
 Каждый скрипт принимает свой файл: `python filter_alerts.py other.json`.

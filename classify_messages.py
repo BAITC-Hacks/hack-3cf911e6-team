@@ -165,13 +165,15 @@ def draft_reply(category, topic):
 
 
 def read_messages(path):
-    with open(path, encoding="utf-8") as f:
+    # utf-8-sig, а не utf-8: файл мог быть сохранён Блокнотом Windows с BOM,
+    # иначе BOM попадает в текст первого обращения.
+    with open(path, encoding="utf-8-sig") as f:
         return [line.strip() for line in f if line.strip()]
 
 
 def main(argv):
     path = Path(argv[1]) if len(argv) > 1 else Path(__file__).with_name("messages.txt")
-    if not path.exists():
+    if not path.is_file():  # is_file, а не exists: каталог в аргументе давал трейсбек
         print(f"Файл не найден: {path}", file=sys.stderr)
         return 1
     texts = read_messages(path)

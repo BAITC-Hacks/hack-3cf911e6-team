@@ -10,6 +10,7 @@
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -110,6 +111,66 @@ class TestAlerts(unittest.TestCase):
         self.assertTrue(fa.is_critical({"level": " critical "}))
         self.assertFalse(fa.is_critical({"level": "warn"}))
         self.assertFalse(fa.is_critical({"message": "уровня нет"}))
+        self.assertFalse(fa.is_critical("строка вместо объекта"))
+
+
+class TestBadInput(unittest.TestCase):
+    """Файлы, которые может подсунуть проверяющий: BOM от Блокнота, битый JSON, урезанные поля.
+
+    Требование ко всем случаям: понятное сообщение и код возврата, а не трейсбек.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_script(self, script, *args):
+        return subprocess.run(
+            [sys.executable, str(ROOT / script), *args],
+            cwd=str(ROOT), capture_output=True, encoding="utf-8", errors="replace",
+        )
+
+    def write(self, name, text, encoding="utf-8"):
+        path = self.dir / name
+        path.write_text(text, encoding=encoding)
+        return str(path)
+
+    def test_messages_with_bom(self):
+        path = self.write("m.txt", "Пропал Wi-Fi в корпусе B.\n", encoding="utf-8-sig")
+        result = self.run_script("classify_messages.py", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("﻿", result.stdout)  # BOM не должен попасть в текст обращения
+        self.assertIn("жалоба", result.stdout)
+
+    def test_events_with_bom(self):
+        path = self.write("e.json", '[{"level": "critical", "service": "db", "message": "x"}]',
+                          encoding="utf-8-sig")
+        result = self.run_script("filter_alerts.py", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("критичных 1", result.stdout)
+
+    def test_event_without_optional_fields(self):
+        path = self.write("e.json", '[{"level": "critical", "message": "диск"}]')
+        result = self.run_script("filter_alerts.py", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("критичных 1", result.stdout)
+
+    def test_directory_instead_of_file_is_reported(self):
+        for script in ("classify_messages.py", "filter_alerts.py"):
+            with self.subTest(script=script):
+                result = self.run_script(script, str(self.dir))
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_broken_json_reports_instead_of_crashing(self):
+        for content in ("{ сломано", '{"events": []}'):
+            with self.subTest(content=content):
+                path = self.write("e.json", content)
+                result = self.run_script("filter_alerts.py", path)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("Не удалось прочитать", result.stderr)
 
 
 class TestEndToEnd(unittest.TestCase):

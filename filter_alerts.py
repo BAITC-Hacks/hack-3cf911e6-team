@@ -22,19 +22,32 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def is_critical(event):
-    return str(event.get("level", "")).strip().lower() == "critical"
+    return isinstance(event, dict) and str(event.get("level", "")).strip().lower() == "critical"
+
+
+def load_events(path):
+    """Читает JSON-массив событий. utf-8-sig — файл мог быть сохранён Блокнотом с BOM."""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, list):
+        raise ValueError("ожидался JSON-массив событий")
+    return data
 
 
 def main(argv):
     path = Path(argv[1]) if len(argv) > 1 else Path(__file__).with_name("events.json")
-    if not path.exists():
+    if not path.is_file():  # is_file, а не exists: каталог в аргументе давал трейсбек
         print(f"Файл не найден: {path}", file=sys.stderr)
         return 1
+    try:
+        events = load_events(path)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+        # Понятное сообщение вместо трейсбека: файл читает проверяющий, а не автор.
+        print(f"Не удалось прочитать {path.name}: {exc}", file=sys.stderr)
+        return 1
 
-    events = json.loads(path.read_text(encoding="utf-8"))
     critical = [event for event in events if is_critical(event)]
     for event in critical:
-        print(f"[{event['level']}] {event['service']}: {event['message']}")
+        print(f"[{event.get('level')}] {event.get('service', '?')}: {event.get('message', '')}")
     print(f"критичных {len(critical)}")
     return 0
 
