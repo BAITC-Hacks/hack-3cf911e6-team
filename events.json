@@ -1,0 +1,10 @@
+[
+  {"id": 1, "level": "critical", "service": "storage",  "message": "disk 90%"},
+  {"id": 2, "level": "info",     "service": "auth",     "message": "user login"},
+  {"id": 3, "level": "info",     "service": "host",     "message": "cpu 40%"},
+  {"id": 4, "level": "critical", "service": "payments", "message": "payment failed"},
+  {"id": 5, "level": "info",     "service": "monitor",  "message": "heartbeat"},
+  {"id": 6, "level": "critical", "service": "db",       "message": "db timeout"},
+  {"id": 7, "level": "warn",     "service": "cache",    "message": "cache miss"},
+  {"id": 8, "level": "info",     "service": "ci",       "message": "deploy ok"}
+]
