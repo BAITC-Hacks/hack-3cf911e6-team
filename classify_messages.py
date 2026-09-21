@@ -39,7 +39,8 @@ MODEL = "claude-opus-5"
 RULES = {
     "жалоба": [
         (r"не работает", 3), (r"перестал", 2), (r"пропал", 3), (r"слома", 3),
-        (r"очеред", 2), (r"холодн", 2), (r"грязн", 2), (r"жалоб", 3), (r"хамств", 3),
+        (r"очеред", 2), (r"холодн", 2), (r"грязн", 2), (r"жалоб|жалова|жалу[юе]", 3),
+        (r"хамств", 3),
         (r"груб", 2), (r"долго жд", 2), (r"не могу", 2), (r"отсутствует", 2),
         (r"шум", 2), (r"протека", 2), (r"плохо", 2), (r"ужасн", 2),
         (r"недоволен|недовольна", 2), (r"сбой", 2), (r"не открыва", 2),
@@ -125,6 +126,11 @@ def normalize(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def marker_label(pattern):
+    """Читаемое имя маркера для вывода: без regex-синтаксиса, первый вариант из «или»."""
+    return pattern.split("|")[0].replace(r"\b", "").strip()
+
+
 def score_categories(text):
     """Считает баллы по каждой категории. Возвращает (баллы, сработавшие маркеры)."""
     norm = normalize(text)
@@ -134,7 +140,7 @@ def score_categories(text):
         for pattern, weight in markers:
             if re.search(pattern, norm):
                 scores[category] += weight
-                signals[category].append(pattern.replace(r"\b", ""))
+                signals[category].append(marker_label(pattern))
     if norm.endswith("?"):  # слабый сигнал: вопрос чаще запрос информации
         scores["справка"] += 1
         signals["справка"].append("вопросительный знак")
@@ -238,14 +244,9 @@ def classify_with_llm(texts):
         print(f"режим --llm: {type(exc).__name__}: {exc} — категории по правилам", file=sys.stderr)
         return None
 
+    # Ответ может не содержать какой-то номер; валидирует категории build_results.
     by_id = {item["id"]: item["category"] for item in payload.get("items", [])}
-    result = []
-    for index in range(1, len(texts) + 1):
-        category = by_id.get(index)
-        if category not in CATEGORIES:  # ответ не по схеме — добираем правилами
-            category = classify_by_rules(texts[index - 1])[0]
-        result.append(category)
-    return result
+    return [by_id.get(index) for index in range(1, len(texts) + 1)]
 
 
 # --- Разбор входа и вывод --------------------------------------------------
@@ -258,14 +259,16 @@ def build_results(texts, llm_categories):
     """Собирает по каждому обращению категорию, тему, уверенность и черновик."""
     results = []
     for index, text in enumerate(texts, 1):
-        category, confidence, signals = classify_by_rules(text)
-        source = "правила"
+        rule_category, confidence, signals = classify_by_rules(text)
+        category, source = rule_category, "правила"
         if llm_categories:
             llm_category = llm_categories[index - 1]
-            source = "llm"
-            if llm_category != category:  # расхождение с правилами — повод проверить руками
-                confidence = "низкая"
-            category = llm_category
+            # Единственное место, где проверяется категория: что угодно вне трёх
+            # разрешённых значений (пропущенный номер, ответ не по схеме) — это правила.
+            if llm_category in CATEGORIES:
+                category, source = llm_category, "llm"
+                if category != rule_category:  # расхождение — повод проверить руками
+                    confidence = "низкая"
         topic = detect_topic(text)
         results.append({
             "id": index,
@@ -273,6 +276,8 @@ def build_results(texts, llm_categories):
             "category": category,
             "confidence": confidence,
             "source": source,
+            # Категория и сигналы правил сохраняются всегда — это кросс-проверка ответа LLM.
+            "rule_category": rule_category,
             "signals": signals,
             "topic": topic,
             "reply": draft_reply(category, topic),
@@ -288,7 +293,11 @@ def print_report(results, source_label):
         details = [f"уверенность: {item['confidence']}"]
         if item["topic"]:
             details.append(f"тема: {item['topic']}")
-        if item["signals"]:
+        if item["category"] != item["rule_category"]:
+            # Категория от LLM разошлась с правилами — показываем расхождение, а не
+            # сигналы чужой категории, иначе объяснение противоречит вердикту.
+            details.append(f"правила дали: {item['rule_category']}")
+        elif item["signals"]:
             details.append("сигналы: " + ", ".join(item["signals"]))
         print(f"    категория: {item['category']}  ({'; '.join(details)})")
         print("    черновик ответа:")
